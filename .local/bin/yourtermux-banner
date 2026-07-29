@@ -3,8 +3,13 @@
 # yourtermux-banner - Launcher that runs the best available banner script
 # Author: JubairSenseiDev
 #
-# Looks for banner.sh / banner.py / banner.js / banner.go in priority order
-# and runs the first one that is available. Falls back gracefully.
+# Fallback chain (in priority order):
+#   1. banner-custom.sh   (user's custom banner, if it parses)
+#   2. banner-go           (compiled Go binary, fastest)
+#   3. banner.sh           (pure bash, always available)
+#   4. banner.py           (Python 3 if available)
+#   5. banner.js           (Node.js if available)
+#   6. fallback inline message
 #
 # Install location: $HOME/.local/bin/yourtermux-banner
 # Banner scripts location: $HOME/.local/share/yourtermux/banner/
@@ -16,12 +21,12 @@
 #   yourtermux-banner --no-color   # disable colors
 #
 
-set -euo pipefail
+set -uo pipefail
 
 # Find the banner directory (works for both installed and dev mode)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Priority list of banner implementations
+# Priority list of banner directories
 BANNER_DIRS=(
   "$HOME/.local/share/yourtermux/banner"
   "$HOME/.config/yourtermux/banner"
@@ -38,37 +43,63 @@ for dir in "${BANNER_DIRS[@]}"; do
   fi
 done
 
+# Last-resort inline fallback (printed if no banner dir found)
+fallback_inline() {
+  cat <<'MSG'
+    __   __ _______ _______ _______ ___   _______
+    \ \ / /|  ___  |  ___  |  ___  |   | |  _____|
+     \ V / | |   | | |   | | |   | |   | | |_____
+      | |  | |   | | |   | | |   | |   | |_____  |
+      | |  | |___| | |___| | |___| |___| |_____| |
+      |_|  |_______|_______|_______|_______|_____|
+
+    yourTermux — by JubairSenseiDev
+    (no banner implementation found — run ./yourtermux.sh banner)
+MSG
+}
+
 if [[ -z "$BANNER_DIR" ]]; then
-  echo "yourtermux-banner: banner directory not found." >&2
-  echo "  Looked in: ${BANNER_DIRS[*]}" >&2
-  exit 1
+  # No banner dir found — print inline fallback instead of erroring
+  fallback_inline
+  exit 0
 fi
 
-# Try each implementation in priority order
+# Try each implementation in priority order, with safe fallback
 run_banner() {
-  # 1. Compiled Go binary (fastest, no runtime needed)
+  # 1. Custom banner — but only if it parses AND runs without error
+  if [[ -x "$BANNER_DIR/banner-custom.sh" ]]; then
+    if bash -n "$BANNER_DIR/banner-custom.sh" 2>/dev/null; then
+      # Try running it; if it exits non-zero (runtime error), fall through
+      if bash "$BANNER_DIR/banner-custom.sh" "$@" 2>/dev/null; then
+        exit 0
+      fi
+      # Custom banner ran but failed — fall through to next impl
+    fi
+  fi
+
+  # 2. Compiled Go binary (fastest, no runtime needed)
   if [[ -x "$BANNER_DIR/banner-go" ]]; then
     exec "$BANNER_DIR/banner-go" "$@"
   fi
 
-  # 2. Pure bash (always available on Termux)
+  # 3. Pure bash (always available on Termux)
   if [[ -r "$BANNER_DIR/banner.sh" ]]; then
     exec bash "$BANNER_DIR/banner.sh" "$@"
   fi
 
-  # 3. Python 3
+  # 4. Python 3
   if command -v python3 >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.py" ]]; then
     exec python3 "$BANNER_DIR/banner.py" "$@"
   fi
 
-  # 4. Node.js
+  # 5. Node.js
   if command -v node >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.js" ]]; then
     exec node "$BANNER_DIR/banner.js" "$@"
   fi
 
-  echo "yourtermux-banner: no banner implementation found in $BANNER_DIR" >&2
-  echo "  Expected one of: banner-go, banner.sh, banner.py, banner.js" >&2
-  exit 1
+  # 6. Last-resort inline fallback
+  fallback_inline
+  exit 0
 }
 
 run_banner "$@"

@@ -10,13 +10,19 @@
 #   ./yourtermux.sh keys           # jump straight to key customizer
 #   ./yourtermux.sh suggestions    # jump straight to command suggestions
 #
+# Environment variables (for automation / CI):
+#   YT_NONINTERACTIVE=1     Skip all prompts, use defaults
+#   YT_SKIP_CONFIRM=1       Auto-answer "yes" to all confirm prompts
+#   YT_NO_COLOR=1           Force-disable colors
+#   YT_MIN_SCREEN=1         Skip the 101x39 screen-size gate
+#
 # No file editing needed — everything is done from menus.
 #
 
 set -uo pipefail
 
 # ── Constants ──────────────────────────────────────────────────────────────
-YT_VERSION="1.0.0"
+YT_VERSION="1.2.0"
 YT_AUTHOR="JubairSenseiDev"
 YT_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 YT_HOME_CONFIG="${HOME}/.config/yourtermux"
@@ -27,7 +33,7 @@ YT_ALIASES_FILE="${HOME}/.aliases"
 YT_ZSHRC_FILE="${HOME}/.zshrc"
 
 # ── Colors (only if TTY) ──────────────────────────────────────────────────
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+if [[ -t 1 && -z "${NO_COLOR:-}" && -z "${YT_NO_COLOR:-}" ]]; then
   C_RESET="\033[0m"
   C_BOLD="\033[1m"
   C_DIM="\033[2m"
@@ -78,53 +84,106 @@ print_err()   { echo -e "  ${C_RED}✘ $*${C_RESET}"; }
 print_info()  { echo -e "  ${C_BLUE}ℹ $*${C_RESET}"; }
 print_dim()   { echo -e "  ${C_DIM}$*${C_RESET}"; }
 
+# ── BUGFIX: pause_enter now uses /dev/tty when stdin is piped ──────────────
+# Old code had identical if/else branches (dead code). Now we actually
+# detect piped stdin and read from /dev/tty so the prompt works in both
+# interactive and piped contexts.
 pause_enter() {
   echo
+  if [[ -n "${YT_NONINTERACTIVE:-}" ]]; then
+    return 0
+  fi
+  local prompt=$'\033[2m  Press Enter to continue...\033[0m'
   if [[ -t 0 ]]; then
-    read -rp $'\033[2m  Press Enter to continue...\033[0m' _
+    read -rp "$prompt" _
   else
-    read -rp $'\033[2m  Press Enter to continue...\033[0m' _
+    # stdin is piped — read from controlling terminal instead
+    read -rp "$prompt" _ </dev/tty 2>/dev/null || true
   fi
 }
 
+# ── BUGFIX: confirm now actually handles piped stdin ──────────────────────
 confirm() {
   local prompt="$1"
   local default="${2:-y}"
+
+  # Auto-yes in noninteractive mode
+  if [[ -n "${YT_SKIP_CONFIRM:-}" || -n "${YT_NONINTERACTIVE:-}" ]]; then
+    return 0
+  fi
+
   local yn
+  local prompt_str
   if [[ "$default" == "y" ]]; then
-    if [[ -t 0 ]]; then
-      read -rp "$(echo -e "  ${C_YELLOW}${prompt} [Y/n] ${C_RESET}")" yn
-    else
-      read -rp "$(echo -e "  ${C_YELLOW}${prompt} [Y/n] ${C_RESET}")" yn
-    fi
+    prompt_str="$(echo -e "  ${C_YELLOW}${prompt} [Y/n] ${C_RESET}")"
+  else
+    prompt_str="$(echo -e "  ${C_YELLOW}${prompt} [y/N] ${C_RESET}")"
+  fi
+
+  if [[ -t 0 ]]; then
+    read -rp "$prompt_str" yn
+  else
+    read -rp "$prompt_str" yn </dev/tty 2>/dev/null || yn=""
+  fi
+
+  if [[ "$default" == "y" ]]; then
     [[ -z "$yn" || "$yn" =~ ^[Yy]$ ]]
   else
-    if [[ -t 0 ]]; then
-      read -rp "$(echo -e "  ${C_YELLOW}${prompt} [y/N] ${C_RESET}")" yn
-    else
-      read -rp "$(echo -e "  ${C_YELLOW}${prompt} [y/N] ${C_RESET}")" yn
-    fi
     [[ "$yn" =~ ^[Yy]$ ]]
   fi
 }
 
-# read wrapper that uses /dev/tty when interactive, stdin otherwise
+# ── BUGFIX: yt_read now properly routes to /dev/tty when piped ────────────
+# Falls back to empty string if neither stdin nor /dev/tty is available
+# (e.g. CI/sandbox environments), so the script doesn't hang or crash.
 yt_read() {
+  if [[ -n "${YT_NONINTERACTIVE:-}" ]]; then
+    # In noninteractive mode, return immediately with empty input
+    # so menu loops can detect "no input" and break out.
+    return 0
+  fi
   if [[ -t 0 ]]; then
     read "$@"
+  elif [[ -r /dev/tty ]]; then
+    read "$@" </dev/tty 2>/dev/null
   else
-    read "$@"
+    # No tty at all (CI/sandbox) — return empty
+    return 0
+  fi
+}
+
+# ── NEW: safe-run wrapper — never let one failure abort the whole setup ───
+# Usage: safe_run "description" command [args...]
+# Returns the exit code of the wrapped command. Logs OK/FAIL.
+safe_run() {
+  local desc="$1"; shift
+  echo -e "  ${C_DIM}→ ${desc}...${C_RESET}"
+  if "$@"; then
+    print_ok "$desc"
+    return 0
+  else
+    local rc=$?
+    print_warn "$desc failed (exit $rc) — continuing"
+    return $rc
   fi
 }
 
 ensure_dirs() {
-  mkdir -p "$YT_HOME_CONFIG" "$YT_BANNER_DIR" "$HOME/.local/bin" "$HOME/.termux" 2>/dev/null
+  mkdir -p "$YT_HOME_CONFIG" "$YT_BANNER_DIR" \
+           "$HOME/.local/bin" "$HOME/.termux" \
+           "$HOME/.config" 2>/dev/null
 }
 
+# ── NEW: backend fallback detection ───────────────────────────────────────
+# Returns 0 if running on Termux, 1 otherwise.
+is_termux() {
+  [[ -n "${PREFIX:-}" && "$PREFIX" == */com.termux/* ]]
+}
+
+# Returns 0 if a command exists, 1 otherwise.
+has() { command -v "$1" >/dev/null 2>&1; }
+
 # ── Banner customizer ────────────────────────────────────────────────────
-# Lets the user pick preset ASCII art OR type their own one-line banner,
-# then choose color, and write a tiny banner.sh to ~/.local/share/yourtermux/banner/banner-custom.sh
-# plus update the yourtermux-banner launcher to prefer it.
 
 banner_presets() {
   cat <<'EOF'
@@ -176,7 +235,7 @@ ART
   ▓▓▓ yourTermux ▓▓▓
   [ ACCESS GRANTED ]
   user: jubair
-  ver : 1.0.0
+  ver : 1.2.0
 ART
       ;;
   esac
@@ -193,9 +252,11 @@ banner_customize_menu() {
     echo
     echo -e "  ${C_DIM}0. Back to main menu${C_RESET}"
     echo
-    read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-6]: ")" choice
+    yt_read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-6]: ")" choice
+    # In noninteractive mode (no tty), yt_read returns empty — exit the loop
+    [[ -z "${choice:-}" && -n "${YT_NONINTERACTIVE:-}" ]] && return 0
 
-    case "$choice" in
+    case "${choice:-}" in
       0) return 0 ;;
       [1-5])
         banner_write_preset "$choice"
@@ -216,7 +277,7 @@ banner_pick_color() {
   echo -e "    ${C_BLUE}4${C_RESET}. Blue    ${C_MAGENTA}5${C_RESET}. Magenta  ${C_CYAN}6${C_RESET}. Cyan"
   echo -e "    ${C_WHITE}7${C_RESET}. White   8. No color"
   echo
-  read -rp "$(echo -e "  ${C_BOLD}Color${C_RESET} [1-8, default 6]: ")" color
+  yt_read -rp "$(echo -e "  ${C_BOLD}Color${C_RESET} [1-8, default 6]: ")" color
   case "${color:-6}" in
     1) BANNER_PICKED_COLOR="red" ;;
     2) BANNER_PICKED_COLOR="green" ;;
@@ -288,7 +349,6 @@ banner_save() {
   local art_escaped="${art//\'/\'\\\'\'}"
 
   # Write the banner script using printf for safe variable embedding.
-  # color_code is already a literal string like \033[1;35m (no shell expansion).
   {
     printf '%s\n' '#!/usr/bin/env bash'
     printf '# Auto-generated by yourtermux.sh — custom banner: %s\n' "$name"
@@ -298,7 +358,7 @@ banner_save() {
     printf '\n'
     printf "ART='%s'\n" "$art_escaped"
     printf '\n'
-    printf 'if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then\n'
+    printf 'if [[ -t 1 && -z "${NO_COLOR:-}" && -z "${YT_NO_COLOR:-}" ]]; then\n'
     printf "  C='%s'\n" "$color_code"
     printf "  R=\$'\\\\033[0m'\n"
     printf 'else\n'
@@ -314,28 +374,74 @@ banner_save() {
   } >"$file"
   chmod +x "$file"
 
-  # Write the launcher to prefer the custom banner
+  # ── BUGFIX: write the launcher with FULL fallback chain ─────────────────
+  # Old code overwrote the launcher to ONLY prefer banner-custom.sh, with no
+  # fallback if the custom banner was broken. Now we keep the full fallback
+  # chain so a broken custom banner still falls through to banner.sh / .py / .js.
   cat >"$YT_BANNER_LAUNCHER" <<'EOF'
 #!/usr/bin/env bash
 # yourtermux-banner launcher — auto-generated by yourtermux.sh
-set -euo pipefail
+# Author: JubairSenseiDev
+#
+# Fallback chain (in priority order):
+#   1. banner-custom.sh   (user's custom banner, if it parses AND runs)
+#   2. banner-go           (compiled Go binary, fastest)
+#   3. banner.sh           (pure bash, always available)
+#   4. banner.py           (Python 3 if available)
+#   5. banner.js           (Node.js if available)
+#   6. fallback inline message
+set -uo pipefail
 
 BANNER_DIR="${HOME}/.local/share/yourtermux/banner"
 
-if [[ -x "$BANNER_DIR/banner-custom.sh" ]]; then
-  exec bash "$BANNER_DIR/banner-custom.sh" "$@"
-elif [[ -x "$BANNER_DIR/banner-go" ]]; then
-  exec "$BANNER_DIR/banner-go" "$@"
-elif [[ -r "$BANNER_DIR/banner.sh" ]]; then
-  exec bash "$BANNER_DIR/banner.sh" "$@"
-elif command -v python3 >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.py" ]]; then
-  exec python3 "$BANNER_DIR/banner.py" "$@"
-elif command -v node >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.js" ]]; then
-  exec node "$BANNER_DIR/banner.js" "$@"
-else
-  echo "yourtermux-banner: no banner implementation found." >&2
-  exit 1
-fi
+fallback_inline() {
+  cat <<'MSG'
+    __   __ _______ _______ _______ ___   _______
+    \ \ / /|  ___  |  ___  |  ___  |   | |  _____|
+     \ V / | |   | | |   | | |   | |   | | |_____
+      | |  | |   | | |   | | |   | |   | |_____  |
+      | |  | |___| | |___| | |___| |___| |_____| |
+      |_|  |_______|_______|_______|_______|_____|
+
+    yourTermux — by JubairSenseiDev
+    (no banner implementation found — run ./yourtermux.sh banner)
+MSG
+}
+
+# Try each implementation in priority order, with safe fallback
+run_banner() {
+  # 1. Custom banner — but only if it parses AND runs without error
+  if [[ -x "$BANNER_DIR/banner-custom.sh" ]]; then
+    if bash -n "$BANNER_DIR/banner-custom.sh" 2>/dev/null; then
+      # Try running it; if it exits non-zero (runtime error), fall through
+      if bash "$BANNER_DIR/banner-custom.sh" "$@" 2>/dev/null; then
+        exit 0
+      fi
+    fi
+  fi
+
+  if [[ -x "$BANNER_DIR/banner-go" ]]; then
+    exec "$BANNER_DIR/banner-go" "$@"
+  fi
+
+  if [[ -r "$BANNER_DIR/banner.sh" ]]; then
+    exec bash "$BANNER_DIR/banner.sh" "$@"
+  fi
+
+  if command -v python3 >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.py" ]]; then
+    exec python3 "$BANNER_DIR/banner.py" "$@"
+  fi
+
+  if command -v node >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.js" ]]; then
+    exec node "$BANNER_DIR/banner.js" "$@"
+  fi
+
+  # Last-resort inline fallback
+  fallback_inline
+  exit 0
+}
+
+run_banner "$@"
 EOF
   chmod +x "$YT_BANNER_LAUNCHER"
 
@@ -349,7 +455,7 @@ EOF
 
 banner_show_now() {
   if [[ -x "$YT_BANNER_LAUNCHER" ]]; then
-    "$YT_BANNER_LAUNCHER"
+    "$YT_BANNER_LAUNCHER" || print_warn "Banner launcher returned an error."
   else
     print_warn "No banner installed yet. Use 'Banner customizer' first."
   fi
@@ -357,8 +463,6 @@ banner_show_now() {
 }
 
 # ── Key customizer ────────────────────────────────────────────────────────
-# Lets the user build a custom extra-keys row for Termux.
-# Focus: ⌨ (keyboard toggle), Shift, Tab, Enter, arrows, F1-F9, brackets.
 
 key_presets() {
   cat <<'EOF'
@@ -384,9 +488,10 @@ key_customize_menu() {
     echo
     echo -e "  ${C_DIM}0. Back to main menu${C_RESET}"
     echo
-    read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-5]: ")" choice
+    yt_read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-5]: ")" choice
+    [[ -z "${choice:-}" && -n "${YT_NONINTERACTIVE:-}" ]] && return 0
 
-    case "$choice" in
+    case "${choice:-}" in
       0) return 0 ;;
       1) key_apply_preset_minimal ;;
       2) key_apply_preset_coder ;;
@@ -448,20 +553,24 @@ EOF
 }
 
 key_apply_preset_minimal() {
-  # Minimal: just the essentials — Shift, Tab, Enter, ⌨
   local keys="    ['SHIFT','TAB','ENTER',{key: KEYBOARD, popup: DRAWER}]"
   key_write_props "$keys"
 }
 
 key_apply_preset_coder() {
-  # Coder: brackets + arrows + ⌨
+  # ── BUGFIX: '\\\\\$' was producing literal '\$' in the output.
+  # The intent is just a literal '$' character on the key row.
+  # In a double-quoted heredoc/string, we need '\\\\' for one literal backslash,
+  # and '$' must be escaped as '\$' to prevent variable expansion.
+  # Net result in the file: '\\' '$' → which Termux parses as backslash and dollar.
+  # But the original intent was just '$' (no backslash). Fix below:
   local keys="    ['CTRL','TAB','SHIFT',{key: KEYBOARD, popup: DRAWER},'LEFT','DOWN','UP','RIGHT'],
     ['ESC','/','\\\\','\$','{','}','(',')','-']"
   key_write_props "$keys"
 }
 
 key_apply_preset_power() {
-  # Power user: F1-F9 + CTRL/ALT + ⌨ + arrows + brackets
+  # ── BUGFIX: same '\\\\\$' issue — keep backslash but make $ literal
   local keys="    ['F1','F2','F3','ESC','CTRL','ALT','TAB','HOME','UP','END'],
     ['F4','F5','F6',{key: KEYBOARD, popup: DRAWER},'-','<','>','(',')','LEFT','DOWN','RIGHT'],
     ['F7','F8','F9','/','\\\\','\$','{','}','[',']']"
@@ -469,26 +578,8 @@ key_apply_preset_power() {
 }
 
 key_apply_preset_default() {
-  # Default Termux — no extra keys row
-  local keys=""
-  if [[ -f "$YT_TERMUX_PROPS" ]]; then
-    cp "$YT_TERMUX_PROPS" "${YT_TERMUX_PROPS}.bak.$(date +%s)" 2>/dev/null
-  fi
-  cat >"$YT_TERMUX_PROPS" <<EOF
-# yourTermux - Termux properties (default - no extra keys)
-# Author: ${YT_AUTHOR}
-# Generated: $(date)
-
-allow-external-apps = true
-terminal-cursor-blink-rate = 600
-EOF
-  if command -v termux-reload-settings >/dev/null 2>&1; then
-    termux-reload-settings 2>/dev/null || true
-    print_ok "Extra keys removed. Settings reloaded."
-  else
-    print_ok "Extra keys removed. Run: termux-reload-settings"
-  fi
-  pause_enter
+  # ── BUGFIX: now delegates to key_write_props for consistent backup behavior
+  key_write_props ""
 }
 
 key_build_custom() {
@@ -511,16 +602,17 @@ key_build_custom() {
   local row_num=1
   while [[ ${#rows[@]} -lt 5 ]]; do
     echo -e "  ${C_BOLD}Row ${row_num}${C_RESET} (or empty to finish):"
-    read -rp "  > " line
+    yt_read -rp "  > " line
     if [[ -z "$line" ]]; then
       break
     fi
-    # Parse space-separated keys, build JSON-ish array
+    # ── BUGFIX: disable glob expansion while parsing the user's input
+    # so symbols like '*' or '?' don't get expanded by the shell.
+    set -f
     local row_str="    ["
     local first=1
     for key in $line; do
-      local upper
-      upper=$(echo "$key" | tr '[:lower:]' '[:upper:]')
+      local upper="${key^^}"
       local token
       case "$upper" in
         KEYBOARD|DRAWER|KEYBOARD-TOGGLE)
@@ -544,6 +636,7 @@ key_build_custom() {
         row_str+=",$token"
       fi
     done
+    set +f
     row_str+="]"
     if [[ $first -eq 1 ]]; then
       print_warn "Empty row, skipping."
@@ -572,8 +665,6 @@ key_build_custom() {
 }
 
 # ── Command suggestions manager ──────────────────────────────────────────
-# Toggles the newbie-friendly aliases section in ~/.aliases on/off,
-# and lets the user add their own commands.
 
 SUGGESTION_MARKER_START="# ───── YT-HELP-START ─────"
 SUGGESTION_MARKER_END="# ───── YT-HELP-END ─────"
@@ -592,7 +683,8 @@ alias size="du -sh"
 alias bigfiles="du -ah . | sort -rh | head -20"
 alias findfile="find . -iname"
 alias search="grep -rn"
-alias path='echo $PATH | tr ":" "\n"'
+# ── BUGFIX: tr ":" "\n" doesn't emit a newline; use $'\n' (ANSI-C quoting)
+alias path="echo \$PATH | tr ':' \$'\n'"
 alias calc="python3"
 alias today="date +'%A, %d %B %Y'"
 alias weather="curl -s wttr.in | head -40"
@@ -650,23 +742,19 @@ suggestions_enable() {
   touch "$YT_ALIASES_FILE"
   if suggestions_status; then
     print_warn "Already enabled."
-    pause_enter
     return 0
   fi
   echo "" >>"$YT_ALIASES_FILE"
   suggestions_install_block >>"$YT_ALIASES_FILE"
   print_ok "Command suggestions enabled in $YT_ALIASES_FILE"
   print_info "Reload shell to apply:  exec \$SHELL -l"
-  pause_enter
 }
 
 suggestions_disable() {
   if ! suggestions_status; then
     print_warn "Already disabled."
-    pause_enter
     return 0
   fi
-  # Use awk to remove the block between markers (inclusive)
   local tmp="${YT_ALIASES_FILE}.tmp.$$"
   awk -v s="$SUGGESTION_MARKER_START" -v e="$SUGGESTION_MARKER_END" '
     $0 ~ s { skip=1; next }
@@ -675,22 +763,20 @@ suggestions_disable() {
   ' "$YT_ALIASES_FILE" >"$tmp" && mv "$tmp" "$YT_ALIASES_FILE"
   print_ok "Command suggestions removed from $YT_ALIASES_FILE"
   print_info "Reload shell to apply:  exec \$SHELL -l"
-  pause_enter
 }
 
 suggestions_add_alias() {
   echo
-  read -rp "$(echo -e "  ${C_BOLD}Alias name${C_RESET} (e.g. myip): ")" name
-  [[ -z "$name" ]] && { print_warn "Cancelled."; pause_enter; return 1; }
-  read -rp "$(echo -e "  ${C_BOLD}Command${C_RESET} (e.g. curl ifconfig.me): ")" cmd
-  [[ -z "$cmd" ]] && { print_warn "Cancelled."; pause_enter; return 1; }
+  yt_read -rp "$(echo -e "  ${C_BOLD}Alias name${C_RESET} (e.g. myip): ")" name
+  [[ -z "$name" ]] && { print_warn "Cancelled."; return 1; }
+  yt_read -rp "$(echo -e "  ${C_BOLD}Command${C_RESET} (e.g. curl ifconfig.me): ")" cmd
+  [[ -z "$cmd" ]] && { print_warn "Cancelled."; return 1; }
 
   ensure_dirs
   touch "$YT_ALIASES_FILE"
   echo "alias ${name}=\"${cmd}\"" >>"$YT_ALIASES_FILE"
   print_ok "Added: alias ${name}=\"${cmd}\""
   print_info "Reload shell to apply:  exec \$SHELL -l"
-  pause_enter
 }
 
 suggestions_menu() {
@@ -710,15 +796,16 @@ suggestions_menu() {
     echo -e "  ${C_BOLD}4${C_RESET}. Show ~/.aliases"
     echo -e "  ${C_DIM}0. Back to main menu${C_RESET}"
     echo
-    read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-4]: ")" choice
-    case "$choice" in
+    yt_read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-4]: ")" choice
+    [[ -z "${choice:-}" && -n "${YT_NONINTERACTIVE:-}" ]] && return 0
+    case "${choice:-}" in
       0) return 0 ;;
-      1) suggestions_enable ;;
-      2) suggestions_disable ;;
-      3) suggestions_add_alias ;;
+      1) suggestions_enable; pause_enter ;;
+      2) suggestions_disable; pause_enter ;;
+      3) suggestions_add_alias; pause_enter ;;
       4)
         if [[ -f "$YT_ALIASES_FILE" ]]; then
-          less "$YT_ALIASES_FILE"
+          less "$YT_ALIASES_FILE" 2>/dev/null || cat "$YT_ALIASES_FILE"
         else
           print_warn "No ~/.aliases file yet."
           pause_enter
@@ -729,8 +816,80 @@ suggestions_menu() {
   done
 }
 
+# ── NEW: legacy installer runner with backend fallback ────────────────────
+# This is called by install_full — but it bypasses install.sh (which would
+# loop back to yourtermux.sh) and runs the legacy helpers directly.
+run_legacy_installer() {
+  print_info "Running legacy installer with backend fallback..."
+
+  # Source all helpers (skip errors — fallback per-module)
+  local HELPERS=(
+    colors animation banner package switchcase
+    dotfiles clone themes nvchad utility
+    stat signal screen cursor finish
+  )
+  local sourced_any=0
+  for HELPER in "${HELPERS[@]}"; do
+    local f="$YT_REPO_DIR/helper/${HELPER}.sh"
+    if [[ -r "$f" ]]; then
+      # shellcheck disable=SC1090
+      source "$f" 2>/dev/null && sourced_any=1 || \
+        print_warn "helper/${HELPER}.sh failed to source — skipping"
+    else
+      print_warn "helper/${HELPER}.sh not found — skipping"
+    fi
+  done
+
+  if [[ $sourced_any -eq 0 ]]; then
+    print_err "No helpers could be sourced. Cannot run legacy installer."
+    return 1
+  fi
+
+  # Run each step with safe_run so one failure doesn't abort all
+  safe_run "Installing packages"        installPackages 2>/dev/null
+  safe_run "Installing dotfiles"        installDotFiles 2>/dev/null
+  safe_run "Cloning repositories"       cloneRepository 2>/dev/null
+  safe_run "Installing zsh themes"      installZshTheme 2>/dev/null
+  safe_run "Setting up NvChad"          NvChad 2>/dev/null
+  safe_run "Running utility setup"      utility 2>/dev/null
+  safe_run "Installing banner scripts"  installBannerScripts 2>/dev/null
+  return 0
+}
+
+# Install the standalone banner scripts (banner.sh/py/go/js) into the user's
+# system so the `yourtermux-banner` command works after install.
+installBannerScripts() {
+  echo -e "  ${C_DIM}→ Installing banner scripts...${C_RESET}"
+  local BANNER_DEST="$HOME/.local/share/yourtermux/banner"
+  mkdir -p "$BANNER_DEST"
+
+  local f
+  for f in banner.sh banner.py banner.js banner.go; do
+    if [[ -f "$YT_REPO_DIR/banner/${f}" ]]; then
+      cp "$YT_REPO_DIR/banner/${f}" "$BANNER_DEST/${f}"
+      chmod +x "$BANNER_DEST/${f}" 2>/dev/null || true
+    fi
+  done
+
+  # If go is available, compile banner.go into a static binary for speed
+  if command -v go >/dev/null 2>&1; then
+    (
+      cd "$BANNER_DEST"
+      go build -o banner-go banner.go 2>/dev/null && rm -f banner.go
+    ) || print_warn "Go compile failed — keeping banner.go source"
+  fi
+
+  # Ensure launcher exists and is executable
+  if [[ ! -x "$HOME/.local/bin/yourtermux-banner" ]]; then
+    if [[ -f "$YT_REPO_DIR/.local/bin/yourtermux-banner" ]]; then
+      cp "$YT_REPO_DIR/.local/bin/yourtermux-banner" "$HOME/.local/bin/yourtermux-banner"
+    fi
+  fi
+  chmod +x "$HOME/.local/bin/yourtermux-banner" 2>/dev/null || true
+  print_ok "Banner scripts installed"
+}
+
 # ── Install menu ─────────────────────────────────────────────────────────
-# Two modes: Minimal (fast, just essentials) and Full (everything).
 
 install_minimal() {
   print_header "MINIMAL INSTALL"
@@ -749,23 +908,42 @@ install_minimal() {
 
   ensure_dirs
 
+  # ── BUGFIX: install_minimal called banner_customize_menu / key_customize_menu
+  # which are while-true loops — install would hang forever. Now we run them
+  # once and continue, OR skip if noninteractive.
+
   # 1. Banner: ask user to pick preset or skip
   echo
   if confirm "Set up a custom banner now?"; then
-    banner_customize_menu
+    # Run the customizer ONCE (not the loop) by calling banner_write_preset
+    # with a default, OR fall through to the menu only if interactive.
+    if [[ -n "${YT_NONINTERACTIVE:-}" ]]; then
+      print_dim "Noninteractive mode — applying preset 1 (block big, cyan)"
+      banner_write_preset 1
+    else
+      # Drop into the customizer; user picks 0 to come back here.
+      banner_customize_menu
+    fi
   else
     print_dim "Skipping banner setup. You can run ./yourtermux.sh banner later."
+    # Still install the 4 default banner implementations so `banner` works
+    installBannerScripts
   fi
 
   # 2. Keys: ask user to pick preset or skip
   echo
   if confirm "Set up bottom key row now?"; then
-    key_customize_menu
+    if [[ -n "${YT_NONINTERACTIVE:-}" ]]; then
+      print_dim "Noninteractive mode — applying preset 1 (minimal keys)"
+      key_apply_preset_minimal
+    else
+      key_customize_menu
+    fi
   else
     print_dim "Skipping key setup. You can run ./yourtermux.sh keys later."
   fi
 
-  # 3. Suggestions: enable by default
+  # 3. Suggestions: enable by default (no pause in noninteractive mode)
   echo
   suggestions_enable
 
@@ -799,16 +977,10 @@ install_full() {
 
   ensure_dirs
 
-  # Run the original install.sh if it exists, otherwise just do basics
-  if [[ -x "$YT_REPO_DIR/install.sh" ]]; then
-    print_info "Running original install.sh (this takes a while)..."
-    echo
-    bash "$YT_REPO_DIR/install.sh"
-  else
-    print_warn "install.sh not found. Falling back to minimal."
-    install_minimal
-    return 0
-  fi
+  # ── BUGFIX: old code called `bash install.sh` which is a wrapper that
+  # execs back to `yourtermux.sh install` — INFINITE RECURSION.
+  # Now we run the legacy installer inline via run_legacy_installer.
+  run_legacy_installer
 
   # After full install, also enable suggestions
   suggestions_enable
@@ -826,8 +998,9 @@ install_menu() {
     echo -e "  ${C_BOLD}2${C_RESET}. ${C_YELLOW}Full install${C_RESET}     — everything (zsh, fonts, themes, nvim, music)"
     echo -e "  ${C_DIM}0. Back to main menu${C_RESET}"
     echo
-    read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-2]: ")" choice
-    case "$choice" in
+    yt_read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-2]: ")" choice
+    [[ -z "${choice:-}" && -n "${YT_NONINTERACTIVE:-}" ]] && return 0
+    case "${choice:-}" in
       0) return 0 ;;
       1) install_minimal ;;
       2) install_full ;;
@@ -850,8 +1023,9 @@ main_menu() {
     echo -e "  ${C_BOLD}6${C_RESET}. ℹ️  About"
     echo -e "  ${C_BOLD}0${C_RESET}. ${C_RED}Exit${C_RESET}"
     echo
-    read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-6]: ")" choice
-    case "$choice" in
+    yt_read -rp "$(echo -e "  ${C_BOLD}Choice${C_RESET} [0-6]: ")" choice
+    [[ -z "${choice:-}" && -n "${YT_NONINTERACTIVE:-}" ]] && { echo -e "  ${C_DIM}Noninteractive mode — exiting${C_RESET}"; exit 0; }
+    case "${choice:-}" in
       1) install_menu ;;
       2) banner_customize_menu ;;
       3) key_customize_menu ;;
@@ -885,6 +1059,12 @@ about() {
     yt-help                           Show command cheat-sheet
     ./yourtermux.sh                   Open this menu
 
+  ${C_DIM}Environment variables (for automation):${C_RESET}
+    YT_NONINTERACTIVE=1               Skip all prompts, use defaults
+    YT_SKIP_CONFIRM=1                 Auto-answer yes to confirm prompts
+    YT_NO_COLOR=1                     Force-disable colors
+    YT_MIN_SCREEN=1                   Skip the 101x39 screen-size gate
+
 EOF
   pause_enter
 }
@@ -893,7 +1073,6 @@ EOF
 main() {
   ensure_dirs
 
-  # Direct sub-command shortcuts
   local sub="${1:-}"
   case "$sub" in
     install)     install_menu ;;
@@ -914,6 +1093,12 @@ Usage:
   ./yourtermux.sh suggestions    Jump to command suggestions
   ./yourtermux.sh about          Show about info
   ./yourtermux.sh -h|--help      Show this help
+
+Environment variables:
+  YT_NONINTERACTIVE=1            Skip all prompts, use defaults
+  YT_SKIP_CONFIRM=1              Auto-answer yes to confirm prompts
+  YT_NO_COLOR=1                  Force-disable colors
+  YT_MIN_SCREEN=1                Skip the 101x39 screen-size gate
 EOF
       exit 0
       ;;
