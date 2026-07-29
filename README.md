@@ -3,7 +3,7 @@
 > Menu-driven Termux setup — everything customizable from one script.
 > Author: **JubairSenseiDev**
 
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](./LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
 ## Quick start
 
@@ -103,4 +103,4 @@ Minimal is recommended for first-time users — you can always run Full later.
 
 ## License
 
-GPL-3.0 — see [LICENSE](./LICENSE).
+MIT — see [LICENSE](./LICENSE). Free to use, modify, distribute, and sublicense. Attribution appreciated but not enforced.
