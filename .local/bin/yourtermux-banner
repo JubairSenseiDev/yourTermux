@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# yourtermux-banner - Launcher that runs the best available banner script
+# Author: JubairSenseiDev
+#
+# Looks for banner.sh / banner.py / banner.js / banner.go in priority order
+# and runs the first one that is available. Falls back gracefully.
+#
+# Install location: $HOME/.local/bin/yourtermux-banner
+# Banner scripts location: $HOME/.local/share/yourtermux/banner/
+#                         (or alongside this script in dev mode)
+#
+# Usage:
+#   yourtermux-banner              # show banner with default color
+#   yourtermux-banner --color red  # override color
+#   yourtermux-banner --no-color   # disable colors
+#
+
+set -euo pipefail
+
+# Find the banner directory (works for both installed and dev mode)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Priority list of banner implementations
+BANNER_DIRS=(
+  "$HOME/.local/share/yourtermux/banner"
+  "$HOME/.config/yourtermux/banner"
+  "$SCRIPT_DIR/../banner"
+  "$SCRIPT_DIR/banner"
+  "$SCRIPT_DIR/../share/yourtermux/banner"
+)
+
+BANNER_DIR=""
+for dir in "${BANNER_DIRS[@]}"; do
+  if [[ -d "$dir" ]]; then
+    BANNER_DIR="$dir"
+    break
+  fi
+done
+
+if [[ -z "$BANNER_DIR" ]]; then
+  echo "yourtermux-banner: banner directory not found." >&2
+  echo "  Looked in: ${BANNER_DIRS[*]}" >&2
+  exit 1
+fi
+
+# Try each implementation in priority order
+run_banner() {
+  # 1. Compiled Go binary (fastest, no runtime needed)
+  if [[ -x "$BANNER_DIR/banner-go" ]]; then
+    exec "$BANNER_DIR/banner-go" "$@"
+  fi
+
+  # 2. Pure bash (always available on Termux)
+  if [[ -r "$BANNER_DIR/banner.sh" ]]; then
+    exec bash "$BANNER_DIR/banner.sh" "$@"
+  fi
+
+  # 3. Python 3
+  if command -v python3 >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.py" ]]; then
+    exec python3 "$BANNER_DIR/banner.py" "$@"
+  fi
+
+  # 4. Node.js
+  if command -v node >/dev/null 2>&1 && [[ -r "$BANNER_DIR/banner.js" ]]; then
+    exec node "$BANNER_DIR/banner.js" "$@"
+  fi
+
+  echo "yourtermux-banner: no banner implementation found in $BANNER_DIR" >&2
+  echo "  Expected one of: banner-go, banner.sh, banner.py, banner.js" >&2
+  exit 1
+}
+
+run_banner "$@"

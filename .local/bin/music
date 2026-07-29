@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# yourTermux - Author: JubairSenseiDev - https://github.com/JubairSenseiDev/yourTermux
+
+function play() {
+
+  if $(mpd --kill); then
+
+    echo -e "Kill pid mpd previous..."
+    echo -e "Starting music..."
+    mpd
+    ncmpcpp
+
+  else
+
+    echo -e "Starting music..."
+    mpd
+    ncmpcpp
+
+  fi
+}
+
+play
